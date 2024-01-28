@@ -18,8 +18,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Vector;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Supplier;
-
 import com.mendix.core.Core;
 import com.mendix.core.actionmanagement.ListenersRegistry;
 import com.mendix.core.actionmanagement.MicroflowCallBuilder;
@@ -35,10 +33,10 @@ import com.mendix.webui.CustomJavaAction;
  */
 public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
 {
-	private final java.lang.String original;
-	private final java.lang.String substitute;
+	private java.lang.String original;
+	private java.lang.String substitute;
 
-	public SubstituteMicroflow(final IContext context, final java.lang.String original, final java.lang.String substitute)
+	public SubstituteMicroflow(IContext context, java.lang.String original, java.lang.String substitute)
 	{
 		super(context);
 		this.original = original;
@@ -51,8 +49,7 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
 		// BEGIN USER CODE
         final MicroflowActionHook instance = MicroflowActionHook.INSTANCE;
         final String prev =
-            instance.substitutionsByOriginalNames
-            .put(Objects.requireNonNull(original), substitute);
+            instance.substitutionsByOriginalNames.put(Objects.requireNonNull(original), substitute);
         if (prev != null) {
             instance.originalsBySubstitutionNames.remove(prev);
         }
@@ -85,7 +82,8 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
          * Source of parameters for this action. For a microflow action 8x can only construct
          * Replace Event Actions with zero args.
          */
-        static final ThreadLocal<MicroflowCallBuilderWrapper> PARAMS_TLS = new ThreadLocal<>();
+        static final ThreadLocal<MicroflowCallBuilderWrapper> PARAMS_TLS =
+            ThreadLocal.<MicroflowCallBuilderWrapper>withInitial(MicroflowCallBuilderWrapper::new);
 
         /** parameters for this action */
         private final MicroflowCallBuilderWrapper builderWr;
@@ -95,13 +93,13 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
          * args
          */
         public SubstituteMicroflowCallbackAction() {
-            super(PARAMS_TLS.get().context);
+            super(PARAMS_TLS.get().currentAction.context());
             this.builderWr = PARAMS_TLS.get();
         }
 
         @java.lang.Override
         public java.lang.Object executeAction() throws Exception {
-            return builderWr.builderSupplier.get().execute(builderWr.context);
+            return builderWr.builder.execute(builderWr.currentAction.context());
         }
 
         @java.lang.Override
@@ -113,20 +111,22 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
     /** Parameters for SubstituteMicroflowCallbackAction */
     private static class MicroflowCallBuilderWrapper {
 
-        /** Context of the original microflow */
-        final IContext context;
+        UserAction<?> currentAction;
+
+        boolean checkResult;
+
+        MicroflowCallBuilder builder;
 
         /**
-         * Supplier of the microflow builder. A delayed construction of the builder is needed
-         * because check() is called twice
+         * @return False return indicates that the actual value was not equal to the expected value.
          */
-        final Supplier<MicroflowCallBuilder> builderSupplier;
-
-        private MicroflowCallBuilderWrapper(
-                final IContext context,
-                final Supplier<MicroflowCallBuilder> builderSupplier) {
-            this.context = context;
-            this.builderSupplier = builderSupplier;
+        boolean compareAndSetAction(final UserAction<?> currentAction) {
+            if (this.currentAction == currentAction) {
+                // already inited
+                return true;
+            }
+            this.currentAction = currentAction;
+            return false;
         }
     }
 
@@ -225,46 +225,76 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
         @Override
         public boolean check(final UserAction<?> currentAction) {
             final String microflowNameCallerPassed = currentAction.getActionName();
-            LOGGER.info("checking microflow: " + microflowNameCallerPassed);
-            String actualMicroflowToCall = substitutionsByOriginalNames.get(microflowNameCallerPassed);
-            if (actualMicroflowToCall == null) {
-                actualMicroflowToCall = originalsBySubstitutionNames.get(microflowNameCallerPassed);
+            if (LOGGER.isTraceEnabled()) {
+                LOGGER.trace("checking microflow: " + microflowNameCallerPassed);
+            }
+            final String actualMicroflowToCall = findActualMicroflowCall(microflowNameCallerPassed);
+
+            MicroflowCallBuilderWrapper builderWr = null;
+            if (actualMicroflowToCall != null) {
+                builderWr = SubstituteMicroflowCallbackAction.PARAMS_TLS.get();
+                // if check() returns true, it's called second time and it should return the same
+                // value
+                if (builderWr.compareAndSetAction(currentAction)) {
+                    if (LOGGER.isDebugEnabled()) {
+                        LOGGER
+                            .debug(
+                                "fast check result " + builderWr.checkResult + " for microflow: "
+                                    + microflowNameCallerPassed);
+                    }
+                    return builderWr.checkResult;
+                } else {
+                    // default for unseen action
+                    builderWr.checkResult = false;
+                }
             }
 
             if (actualMicroflowToCall == null || //
                 isDirectCallByOurJavaAction(currentAction, microflowNameCallerPassed)) {
-                // continue without overriding the action
-                LOGGER.info("continue without overriding the action: " + microflowNameCallerPassed);
+                if (LOGGER.isTraceEnabled()) {
+                    LOGGER
+                        .trace(
+                            "continue without overriding the action: " + microflowNameCallerPassed);
+                }
                 return false;
             }
 
-            final String actualMicroflowToCall2 = actualMicroflowToCall;
-            SubstituteMicroflowCallbackAction.PARAMS_TLS
-                .set(
-                    new MicroflowCallBuilderWrapper(
-                        currentAction.getContext(),
-                        () -> createMicroflowCallBuilder(currentAction, actualMicroflowToCall2)));
-            // override the action
-            LOGGER
-                .info(
-                    "will call " + actualMicroflowToCall2 + " instead of "
-                        + microflowNameCallerPassed);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER
+                    .debug(
+                        "Overriding " + microflowNameCallerPassed + " with "
+                            + actualMicroflowToCall);
+            }
+            builderWr.checkResult = true;
+            builderWr.builder = createMicroflowCallBuilder(currentAction, actualMicroflowToCall);
             return true;
+        }
+
+        private String findActualMicroflowCall(final String microflowNameCallerPassed) {
+            String actualMicroflowToCall =
+                substitutionsByOriginalNames.get(microflowNameCallerPassed);
+            if (actualMicroflowToCall == null) {
+                actualMicroflowToCall = originalsBySubstitutionNames.get(microflowNameCallerPassed);
+            }
+            return actualMicroflowToCall;
         }
 
         private boolean isDirectCallByOurJavaAction(
                 final UserAction<?> currentAction,
                 final String microflowNameCallerPassed) {
-            LOGGER
-                .info(
-                    "Checking if microflow is called directly by our Java Action: "
-                        + microflowNameCallerPassed);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER
+                    .debug(
+                        "Checking if microflow is called directly by our Java Action: "
+                            + microflowNameCallerPassed);
+            }
             final IContext context = currentAction.getContext();
             final Vector<? extends ICoreAction<?>> /* NOSONAR */ actionStack =
                 context.getActionStack();
             synchronized (actionStack) {
-                "".toString();
-                // check() is called twice. When Direct Call By Our Java Action,
+                // If check() returns true it's called second time for the same action with
+                // different action stack.
+                // When Direct Call By Our Java Action,
                 // first time stack:
                 // SubstituteMicroflowCallbackAction
                 // ...
@@ -273,7 +303,11 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
                 // com.mendix.basis.actionmanagement.SyncEventExtendedAction
                 // SubstituteMicroflowCallbackAction
                 // ...
+                //
+                // However, when isDirectCallByOurJavaAction() returns true check() returns false
+                // and we're not called for the second time.
 
+                // really check only the top element
                 for (
                     int rIndex = actionStack.size() - 1, minRIndex = Math.max(rIndex, 0);
                     rIndex >= minRIndex;
@@ -281,18 +315,22 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
                     final ICoreAction<?> action = actionStack.get(rIndex);
                     final Class<?> actionClass = action.getClass();
                     if (SubstituteMicroflowCallbackAction.class.isAssignableFrom(actionClass)) {
-                        LOGGER
-                            .info(
-                                "Microflow is called directly by our Java Action: "
-                                    + microflowNameCallerPassed);
+                        if (LOGGER.isDebugEnabled()) {
+                            LOGGER
+                                .debug(
+                                    "Microflow is called directly by our Java Action: "
+                                        + microflowNameCallerPassed);
+                        }
                         return true;
                     }
                 }
             }
-            LOGGER
-                .info(
-                    "Microflow is not called directly by our Java Action: "
-                        + microflowNameCallerPassed);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER
+                    .debug(
+                        "Microflow is not called directly by our Java Action: "
+                            + microflowNameCallerPassed);
+            }
             return false;
         }
 
