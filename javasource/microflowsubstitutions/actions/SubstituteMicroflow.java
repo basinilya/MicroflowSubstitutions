@@ -16,12 +16,16 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Vector;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
+
 import com.mendix.core.Core;
 import com.mendix.core.actionmanagement.ListenersRegistry;
 import com.mendix.core.actionmanagement.MicroflowCallBuilder;
+import com.mendix.logging.ILogNode;
 import com.mendix.systemwideinterfaces.core.IContext;
+import com.mendix.systemwideinterfaces.core.ICoreAction;
 import com.mendix.systemwideinterfaces.core.UserAction;
 import com.mendix.systemwideinterfaces.core.UserActionListener;
 import com.mendix.webui.CustomJavaAction;
@@ -31,10 +35,10 @@ import com.mendix.webui.CustomJavaAction;
  */
 public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
 {
-	private java.lang.String original;
-	private java.lang.String substitute;
+	private final java.lang.String original;
+	private final java.lang.String substitute;
 
-	public SubstituteMicroflow(IContext context, java.lang.String original, java.lang.String substitute)
+	public SubstituteMicroflow(final IContext context, final java.lang.String original, final java.lang.String substitute)
 	{
 		super(context);
 		this.original = original;
@@ -45,8 +49,16 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
 	public java.lang.Void executeAction() throws Exception
 	{
 		// BEGIN USER CODE
-        MicroflowActionHook.INSTANCE.substitutionsByOriginalNames
+        final MicroflowActionHook instance = MicroflowActionHook.INSTANCE;
+        final String prev =
+            instance.substitutionsByOriginalNames
             .put(Objects.requireNonNull(original), substitute);
+        if (prev != null) {
+            instance.originalsBySubstitutionNames.remove(prev);
+        }
+        if (substitute != null) {
+            instance.originalsBySubstitutionNames.put(substitute, original);
+        }
         return null;
 		// END USER CODE
 	}
@@ -121,6 +133,8 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
     /** Action Listener that can substitute a microflow to call */
     private static class MicroflowActionHook extends UserActionListener<UserAction<?>> {
 
+        private static final ILogNode LOGGER = Core.getLogger("AAAMicroflowSubstitutions");
+
         // various reflect classes, methods, and fields to obtain
         // the information about the called microflow
 
@@ -193,6 +207,8 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
         /** Map of microflow names to substitute */
         final Map<String, String> substitutionsByOriginalNames = new ConcurrentHashMap<>();
 
+        final Map<String, String> originalsBySubstitutionNames = new ConcurrentHashMap<>();
+
         private MicroflowActionHook() {
             super(C_MicroflowImpl);
             // With addReplaceEvent() a microflow action can't be directly replaced with
@@ -207,20 +223,77 @@ public class SubstituteMicroflow extends CustomJavaAction<java.lang.Void>
          *         original microflow
          */
         @Override
-        public boolean check(final UserAction<?> action) {
-            final String originalMicroflowName = action.getActionName();
-            final String substitute = substitutionsByOriginalNames.get(originalMicroflowName);
-            if (substitute == null) {
+        public boolean check(final UserAction<?> currentAction) {
+            final String microflowNameCallerPassed = currentAction.getActionName();
+            LOGGER.info("checking microflow: " + microflowNameCallerPassed);
+            String actualMicroflowToCall = substitutionsByOriginalNames.get(microflowNameCallerPassed);
+            if (actualMicroflowToCall == null) {
+                actualMicroflowToCall = originalsBySubstitutionNames.get(microflowNameCallerPassed);
+            }
+
+            if (actualMicroflowToCall == null || //
+                isDirectCallByOurJavaAction(currentAction, microflowNameCallerPassed)) {
                 // continue without overriding the action
+                LOGGER.info("continue without overriding the action: " + microflowNameCallerPassed);
                 return false;
             }
+
+            final String actualMicroflowToCall2 = actualMicroflowToCall;
             SubstituteMicroflowCallbackAction.PARAMS_TLS
                 .set(
                     new MicroflowCallBuilderWrapper(
-                        action.getContext(),
-                        () -> createMicroflowCallBuilder(action, substitute)));
+                        currentAction.getContext(),
+                        () -> createMicroflowCallBuilder(currentAction, actualMicroflowToCall2)));
             // override the action
+            LOGGER
+                .info(
+                    "will call " + actualMicroflowToCall2 + " instead of "
+                        + microflowNameCallerPassed);
             return true;
+        }
+
+        private boolean isDirectCallByOurJavaAction(
+                final UserAction<?> currentAction,
+                final String microflowNameCallerPassed) {
+            LOGGER
+                .info(
+                    "Checking if microflow is called directly by our Java Action: "
+                        + microflowNameCallerPassed);
+            final IContext context = currentAction.getContext();
+            final Vector<? extends ICoreAction<?>> /* NOSONAR */ actionStack =
+                context.getActionStack();
+            synchronized (actionStack) {
+                "".toString();
+                // check() is called twice. When Direct Call By Our Java Action,
+                // first time stack:
+                // SubstituteMicroflowCallbackAction
+                // ...
+                //
+                // second time stack:
+                // com.mendix.basis.actionmanagement.SyncEventExtendedAction
+                // SubstituteMicroflowCallbackAction
+                // ...
+
+                for (
+                    int rIndex = actionStack.size() - 1, minRIndex = Math.max(rIndex, 0);
+                    rIndex >= minRIndex;
+                    rIndex--) {
+                    final ICoreAction<?> action = actionStack.get(rIndex);
+                    final Class<?> actionClass = action.getClass();
+                    if (SubstituteMicroflowCallbackAction.class.isAssignableFrom(actionClass)) {
+                        LOGGER
+                            .info(
+                                "Microflow is called directly by our Java Action: "
+                                    + microflowNameCallerPassed);
+                        return true;
+                    }
+                }
+            }
+            LOGGER
+                .info(
+                    "Microflow is not called directly by our Java Action: "
+                        + microflowNameCallerPassed);
+            return false;
         }
 
         /**
